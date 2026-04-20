@@ -99,6 +99,182 @@ claude
 
 If you set `PROXY_CLIENT_KEY`, use that value instead of `anything`.
 
+## Windows Setup
+
+This is the simplest setup path if you want to use the prebuilt Windows binary from the GitHub release.
+
+### 1. Download the binary
+
+Download `anthropic-proxy-windows-amd64.exe` from the latest release and place it in a folder such as:
+
+```text
+C:\tools\anthropic-proxy\
+```
+
+Example layout:
+
+```text
+C:\tools\anthropic-proxy\
+  anthropic-proxy-windows-amd64.exe
+  .env
+```
+
+You can rename the binary if you want:
+
+```text
+anthropic-proxy-windows-amd64.exe -> anthropic-proxy.exe
+```
+
+### 2. Create `.env`
+
+Open PowerShell in the same folder and create `.env` from the example:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+If you downloaded only the binary, create `.env` manually. Minimal NVIDIA example:
+
+```env
+UPSTREAM_URL=https://integrate.api.nvidia.com/v1/chat/completions
+UPSTREAM_API_KEY=nvapi-...
+DEFAULT_MODEL=z-ai/glm-5.1
+FORCE_MODEL=1
+LISTEN_ADDR=:8787
+REQUEST_TIMEOUT_SEC=600
+DEBUG=1
+```
+
+### 3. Start the proxy
+
+From PowerShell:
+
+```powershell
+.\anthropic-proxy.exe
+```
+
+If your file still has the release name:
+
+```powershell
+.\anthropic-proxy-windows-amd64.exe
+```
+
+You should see startup logs similar to:
+
+```text
+anthropic-proxy
+  listen   : :8787
+  upstream : https://integrate.api.nvidia.com/v1/chat/completions
+  default  : z-ai/glm-5.1
+  force    : true
+```
+
+### 4. Verify that it is running
+
+In another PowerShell window:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8787/healthz | Select-Object -ExpandProperty Content
+```
+
+Expected output:
+
+```text
+ok
+```
+
+You can also inspect the active config:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8787/ | Select-Object -ExpandProperty Content
+```
+
+### 5. Point Claude Code to the proxy on Windows
+
+For the current PowerShell session only:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
+$env:ANTHROPIC_API_KEY = "anything"
+claude
+```
+
+If you enabled proxy auth:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
+$env:ANTHROPIC_API_KEY = "my-local-proxy-key"
+claude
+```
+
+For persistent user-level environment variables in PowerShell:
+
+```powershell
+[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", "anything", "User")
+```
+
+Then open a new terminal before running:
+
+```powershell
+claude
+```
+
+### 6. Running it in the background on Windows
+
+If you do not want to keep one PowerShell window open, you can start the proxy in a separate process:
+
+```powershell
+Start-Process -FilePath ".\anthropic-proxy.exe" -WorkingDirectory (Get-Location)
+```
+
+If you want log files:
+
+```powershell
+Start-Process -FilePath ".\anthropic-proxy.exe" `
+  -WorkingDirectory (Get-Location) `
+  -RedirectStandardOutput ".\proxy.stdout.log" `
+  -RedirectStandardError ".\proxy.stderr.log"
+```
+
+### 7. Editing config without restart
+
+Most config changes are hot reloaded from `.env`. For example, you can change:
+
+```env
+DEFAULT_MODEL=z-ai/glm-5.1
+```
+
+to:
+
+```env
+DEFAULT_MODEL=meta/llama-3.1-8b-instruct
+```
+
+Then hit:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8787/ | Select-Object -ExpandProperty Content
+```
+
+and the new model should appear without restarting the proxy.
+
+### Windows Troubleshooting
+
+- If PowerShell says the file cannot be found, make sure you are in the correct folder and use `.\anthropic-proxy.exe`.
+- If Windows SmartScreen warns about the binary, use `More info` and then `Run anyway` if you trust the release you downloaded.
+- If port `8787` is already in use, change `LISTEN_ADDR` in `.env` to another port such as `:8788`, then restart the proxy.
+- If Claude Code cannot connect, confirm `http://127.0.0.1:8787/healthz` returns `ok` first.
+- If requests hang, test the upstream directly before blaming the proxy.
+- If you changed `LISTEN_ADDR`, restart is required. That one setting is not hot reloaded.
+- If you use Command Prompt instead of PowerShell, session variables are:
+
+```cmd
+set ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+set ANTHROPIC_API_KEY=anything
+claude
+```
+
 ## How Model Selection Works
 
 ### Default mode

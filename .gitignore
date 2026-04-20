@@ -1,0 +1,5 @@
+.env
+dist/
+anthropic-proxy
+anthropic-proxy.exe
+*.exe

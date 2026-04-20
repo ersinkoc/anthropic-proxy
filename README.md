@@ -1,32 +1,57 @@
 # anthropic-proxy
 
-An Anthropic-compatible reverse proxy for Claude Code and other Anthropic SDK clients.
-It talks to an OpenAI-compatible backend behind the scenes: OpenAI, vLLM, Ollama, LM Studio,
-Groq, DeepSeek, Together, OpenRouter, LiteLLM, fastchat, and more.
+`anthropic-proxy` exposes an Anthropic-compatible `/v1/messages` API to clients such as Claude Code, then forwards requests to any OpenAI-compatible backend.
 
-**Single binary · stdlib-only · zero deps · 5.4 MB**
+It is designed for the practical case where your client always asks for Claude-style model names, but you want to force everything to a model you control from `.env`.
 
-## Architecture
+## What It Does
 
 ```text
-Claude Code ──Anthropic API──▶ anthropic-proxy ──OpenAI API──▶ gpt-5 / qwen / llama / ...
-            /v1/messages                      /v1/chat/completions
+Claude Code / Anthropic SDK
+        |
+        |  POST /v1/messages
+        v
+anthropic-proxy
+        |
+        |  POST /v1/chat/completions
+        v
+OpenAI-compatible upstream
 ```
+
+Supported upstreams include:
+
+- OpenAI
+- NVIDIA NIM
+- Ollama
+- vLLM
+- LM Studio
+- Groq
+- DeepSeek
+- OpenRouter
+- LiteLLM
+
+## Main Behavior
+
+By default, the proxy now treats `DEFAULT_MODEL` as the model to actually use upstream.
+
+That means:
+
+- Claude Code may request `claude-opus`, `claude-sonnet`, or anything else.
+- The proxy will still send your `.env` model upstream when `FORCE_MODEL=1`.
+- You can change the upstream model by editing `.env`.
+- Most config changes hot reload automatically without restarting the process.
 
 ## Features
 
-- `POST /v1/messages` — sync + streaming
-- `POST /v1/messages/count_tokens` — estimated count (~4 chars/token)
+- Anthropic-compatible `POST /v1/messages`
+- Anthropic-compatible `POST /v1/messages/count_tokens`
 - `GET /healthz`
-- **Tool calling** — full Anthropic `tool_use` ↔ OpenAI `tool_calls` conversion, including streaming
-- **Multi-modal** — image block → OpenAI `image_url` data URL
-- **System prompt** — top-level string or block array → OpenAI `role:"system"`
-- **tool_choice** — `auto` / `any`→`required` / `tool`→`function` / `none`
-- **stop_sequences**, **temperature**, **top_p**, **max_tokens** pass through 1:1
-- **Model mapping** — prefix-fallback mapping such as `claude-opus-4-7` → `gpt-5`
-- **Stream state machine** — keeps text and tool_use blocks opening/closing correctly with a single-open-block invariant
-- **Error passthrough** — upstream 4xx/5xx → Anthropic error envelope with the correct error type
-- Optional client-side auth via `PROXY_CLIENT_KEY`
+- Sync and streaming support
+- Tool call conversion between Anthropic and OpenAI formats
+- Image block to `image_url` conversion
+- Optional client auth with `PROXY_CLIENT_KEY`
+- Force-model mode via `.env`
+- Hot reload for request-time config
 
 ## Build
 
@@ -40,7 +65,7 @@ Or:
 make build
 ```
 
-Cross-compile:
+Cross-compile examples:
 
 ```bash
 GOOS=linux   GOARCH=amd64 go build -o dist/anthropic-proxy-linux-amd64 .
@@ -48,142 +73,331 @@ GOOS=darwin  GOARCH=arm64 go build -o dist/anthropic-proxy-darwin-arm64 .
 GOOS=windows GOARCH=amd64 go build -o dist/anthropic-proxy-windows-amd64.exe .
 ```
 
-## Config (env)
+## Quick Start
 
-The proxy auto-loads a local `.env` file on startup. Existing process environment variables still win, so you can override any value from the shell when needed.
-
-| Var | Required | Default | Description |
-|---|---|---|---|
-| `UPSTREAM_URL` | — | `https://api.openai.com/v1/chat/completions` | OpenAI-compatible backend URL |
-| `UPSTREAM_API_KEY` | ✓ | — | Upstream API key, injected as `Bearer` on every request |
-| `MODEL_MAP` | ✓* | `{}` | JSON: `{"claude-opus-4-7":"gpt-5",...}` |
-| `DEFAULT_MODEL` | ✓* | — | Fallback if a model is not found in the mapping |
-| `LISTEN_ADDR` | — | `:8787` | Listen address |
-| `PROXY_CLIENT_KEY` | — | (unset) | If set, incoming `x-api-key` must match |
-| `REQUEST_TIMEOUT_SEC` | — | `600` | Upstream timeout |
-| `DEBUG` | — | `0` | `1` enables per-request logging |
-
-`*` At least one of these is required.
-
-## .env Files
+1. Create your local env file:
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env` with your provider settings. The repository keeps `.env.example` as a safe template and ignores `.env` via `.gitignore`.
+2. Edit `.env`.
 
-## Run
-
-```bash
-UPSTREAM_URL=https://api.openai.com/v1/chat/completions \
-UPSTREAM_API_KEY=sk-... \
-MODEL_MAP='{
-  "claude-opus-4-7":"gpt-5",
-  "claude-sonnet-4-6":"gpt-5",
-  "claude-haiku-4-5":"gpt-5-mini"
-}' \
-./anthropic-proxy
-```
-
-If `.env` is present, running the binary without extra shell exports is enough:
+3. Start the proxy:
 
 ```bash
 ./anthropic-proxy
 ```
 
-## With Claude Code
+4. Point Claude Code to the proxy:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8787
-export ANTHROPIC_API_KEY=anything-works-unless-PROXY_CLIENT_KEY-set
+export ANTHROPIC_API_KEY=anything
 claude
 ```
 
-## Examples
+If you set `PROXY_CLIENT_KEY`, use that value instead of `anything`.
 
-**OpenAI:**
-```text
-UPSTREAM_URL=https://api.openai.com/v1/chat/completions
-UPSTREAM_API_KEY=sk-proj-...
-MODEL_MAP={"claude-opus-4-7":"gpt-5","claude-sonnet-4-6":"gpt-5","claude-haiku-4-5":"gpt-5-mini"}
+## How Model Selection Works
+
+### Default mode
+
+When `FORCE_MODEL=1`, every incoming model is replaced with `DEFAULT_MODEL`.
+
+Example:
+
+Incoming request:
+
+```json
+{
+  "model": "claude-sonnet-4",
+  "max_tokens": 256,
+  "messages": [
+    { "role": "user", "content": "hello" }
+  ]
+}
 ```
 
-**Ollama (local):**
-```text
-UPSTREAM_URL=http://localhost:11434/v1/chat/completions
-UPSTREAM_API_KEY=ollama
-DEFAULT_MODEL=qwen3-coder:30b
+Upstream request becomes:
+
+```json
+{
+  "model": "z-ai/glm-5.1",
+  "messages": [
+    { "role": "user", "content": "hello" }
+  ]
+}
 ```
 
-**vLLM / LM Studio:**
-```text
-UPSTREAM_URL=http://localhost:8000/v1/chat/completions
-UPSTREAM_API_KEY=not-needed
-DEFAULT_MODEL=Qwen/Qwen3-Coder-30B
+if `.env` contains:
+
+```env
+DEFAULT_MODEL=z-ai/glm-5.1
+FORCE_MODEL=1
 ```
 
-**Groq:**
-```text
-UPSTREAM_URL=https://api.groq.com/openai/v1/chat/completions
-UPSTREAM_API_KEY=gsk_...
-MODEL_MAP={"claude-opus-4-7":"llama-3.3-70b-versatile"}
+### Mapping mode
+
+If you set `FORCE_MODEL=0`, the proxy uses:
+
+1. exact match in `MODEL_MAP`
+2. prefix match in `MODEL_MAP`
+3. `DEFAULT_MODEL` as fallback
+
+Example:
+
+```env
+FORCE_MODEL=0
+DEFAULT_MODEL=meta/llama-3.1-8b-instruct
+MODEL_MAP={"claude-opus":"meta/llama-3.1-70b-instruct","claude-sonnet":"meta/llama-3.1-8b-instruct"}
 ```
 
-**DeepSeek:**
-```text
-UPSTREAM_URL=https://api.deepseek.com/v1/chat/completions
-UPSTREAM_API_KEY=sk-...
-MODEL_MAP={"claude-opus-4-7":"deepseek-chat","claude-sonnet-4-6":"deepseek-chat"}
+## Hot Reload
+
+The proxy checks `.env` on requests and reloads it automatically when the file changes.
+
+Hot-reloaded settings:
+
+- `UPSTREAM_URL`
+- `UPSTREAM_API_KEY`
+- `DEFAULT_MODEL`
+- `FORCE_MODEL`
+- `MODEL_MAP`
+- `PROXY_CLIENT_KEY`
+- `REQUEST_TIMEOUT_SEC`
+- `DEBUG`
+
+Not hot-reloaded:
+
+- `LISTEN_ADDR`
+
+Changing `LISTEN_ADDR` still requires restarting the process because the server socket is already bound.
+
+## Config Reference
+
+| Variable | Required | Default | Hot Reload | Description |
+|---|---|---|---|---|
+| `UPSTREAM_URL` | no | `https://api.openai.com/v1/chat/completions` | yes | OpenAI-compatible chat completions endpoint |
+| `UPSTREAM_API_KEY` | yes | none | yes | Bearer token sent upstream |
+| `DEFAULT_MODEL` | yes when `FORCE_MODEL=1` | none | yes | Model to send upstream |
+| `FORCE_MODEL` | no | `1` | yes | Force every incoming request to `DEFAULT_MODEL` |
+| `MODEL_MAP` | no | `{}` | yes | Optional model mapping JSON |
+| `PROXY_CLIENT_KEY` | no | unset | yes | Require clients to send this key |
+| `REQUEST_TIMEOUT_SEC` | no | `600` | yes | Per-request upstream timeout |
+| `DEBUG` | no | `0` | yes | Enable request logging |
+| `LISTEN_ADDR` | no | `:8787` | no | HTTP bind address |
+
+## Example `.env` Files
+
+### NVIDIA NIM
+
+```env
+UPSTREAM_URL=https://integrate.api.nvidia.com/v1/chat/completions
+UPSTREAM_API_KEY=nvapi-...
+DEFAULT_MODEL=meta/llama-3.1-8b-instruct
+FORCE_MODEL=1
+LISTEN_ADDR=:8787
+REQUEST_TIMEOUT_SEC=600
+DEBUG=1
 ```
 
-**NVIDIA NIM:**
-```text
+### NVIDIA with GLM
+
+```env
+UPSTREAM_URL=https://integrate.api.nvidia.com/v1/chat/completions
+UPSTREAM_API_KEY=nvapi-...
+DEFAULT_MODEL=z-ai/glm-5.1
+FORCE_MODEL=1
+LISTEN_ADDR=:8787
+REQUEST_TIMEOUT_SEC=600
+DEBUG=1
+```
+
+### NVIDIA with Minimax
+
+```env
 UPSTREAM_URL=https://integrate.api.nvidia.com/v1/chat/completions
 UPSTREAM_API_KEY=nvapi-...
 DEFAULT_MODEL=minimaxai/minimax-m2.7
+FORCE_MODEL=1
+LISTEN_ADDR=:8787
+REQUEST_TIMEOUT_SEC=600
+DEBUG=1
 ```
 
-## Protocol Notes
+### Ollama
 
-### Request Flow (Anthropic → OpenAI)
+```env
+UPSTREAM_URL=http://localhost:11434/v1/chat/completions
+UPSTREAM_API_KEY=ollama
+DEFAULT_MODEL=qwen3-coder:30b
+FORCE_MODEL=1
+LISTEN_ADDR=:8787
+REQUEST_TIMEOUT_SEC=600
+DEBUG=0
+```
 
-| Anthropic | OpenAI |
-|---|---|
-| `system` (top-level) | first `messages` entry as `{role:"system"}` |
-| `tool_result` block inside a user turn | separate `{role:"tool", tool_call_id}` message |
-| `tool_use` block inside an assistant turn | `tool_calls[].function.arguments` as JSON **string** |
-| `image` block (base64) | `image_url` data URL |
-| `tool_choice: "any"` | `"required"` |
+### LM Studio / vLLM
 
-### Response Flow (OpenAI → Anthropic)
+```env
+UPSTREAM_URL=http://localhost:8000/v1/chat/completions
+UPSTREAM_API_KEY=not-needed
+DEFAULT_MODEL=Qwen/Qwen3-Coder-30B
+FORCE_MODEL=1
+LISTEN_ADDR=:8787
+REQUEST_TIMEOUT_SEC=600
+DEBUG=0
+```
 
-| OpenAI | Anthropic |
-|---|---|
-| `choices[0].message.content` | `content: [{type:"text"}]` |
-| `choices[0].message.tool_calls[]` | `content: [{type:"tool_use", input: object}]` |
-| `finish_reason:"stop"` | `stop_reason:"end_turn"` |
-| `finish_reason:"length"` | `"max_tokens"` |
-| `finish_reason:"tool_calls"` | `"tool_use"` |
+### Mapping mode example
 
-### Stream Event Map
+```env
+UPSTREAM_URL=https://integrate.api.nvidia.com/v1/chat/completions
+UPSTREAM_API_KEY=nvapi-...
+FORCE_MODEL=0
+DEFAULT_MODEL=meta/llama-3.1-8b-instruct
+MODEL_MAP={"claude-opus":"meta/llama-3.1-70b-instruct","claude-sonnet":"meta/llama-3.1-8b-instruct","claude-haiku":"nvidia/llama-3.1-nemotron-nano-8b-v1"}
+LISTEN_ADDR=:8787
+REQUEST_TIMEOUT_SEC=600
+DEBUG=1
+```
 
-OpenAI `chat.completion.chunk` → Anthropic typed event machine:
+## Claude Code Setup
+
+Claude Code only needs an Anthropic-compatible base URL and some API key value.
+
+If proxy auth is disabled:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8787
+export ANTHROPIC_API_KEY=anything
+claude
+```
+
+If proxy auth is enabled:
+
+```env
+PROXY_CLIENT_KEY=my-local-proxy-key
+```
+
+then:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8787
+export ANTHROPIC_API_KEY=my-local-proxy-key
+claude
+```
+
+## API Examples
+
+### Health check
+
+```bash
+curl http://127.0.0.1:8787/healthz
+```
+
+Expected:
 
 ```text
-[first chunk]         → message_start
-[content var, text]   → content_block_start(type=text) + content_block_delta(text_delta)
-[tool_calls[i] var]   → content_block_start(type=tool_use) + content_block_delta(input_json_delta)
-[block changes]       → content_block_stop(old) → content_block_start(new)
-[finish_reason]       → content_block_stop + message_delta + message_stop
+ok
 ```
+
+### Introspection
+
+```bash
+curl http://127.0.0.1:8787/
+```
+
+Example response:
+
+```json
+{
+  "service": "anthropic-proxy",
+  "upstream": "https://integrate.api.nvidia.com/v1/chat/completions",
+  "default_model": "z-ai/glm-5.1",
+  "force_model": true,
+  "models": {},
+  "request_timeout_sec": 600
+}
+```
+
+### Anthropic sync request
+
+```bash
+curl http://127.0.0.1:8787/v1/messages \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4",
+    "max_tokens": 64,
+    "messages": [
+      { "role": "user", "content": "Reply with exactly: proxy works" }
+    ]
+  }'
+```
+
+Example response:
+
+```json
+{
+  "id": "msg_xxx",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-4",
+  "content": [
+    { "type": "text", "text": "proxy works" }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 41,
+    "output_tokens": 3
+  }
+}
+```
+
+### Anthropic streaming request
+
+```bash
+curl http://127.0.0.1:8787/v1/messages \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-opus-4",
+    "stream": true,
+    "max_tokens": 64,
+    "messages": [
+      { "role": "user", "content": "Say hello" }
+    ]
+  }'
+```
+
+### Count tokens
+
+```bash
+curl http://127.0.0.1:8787/v1/messages/count_tokens \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-test","max_tokens":10,"messages":[]}'
+```
+
+## Notes About Upstream Models
+
+- Some upstream models are slower than others.
+- Some reasoning models may emit hidden or partial reasoning content differently.
+- Some providers behave inconsistently in streaming mode.
+- If a model hangs directly at the upstream, the proxy cannot fix that.
+
+For that reason, when debugging:
+
+1. test the upstream directly first
+2. test the same model through the proxy
+3. compare the behavior
 
 ## Known Limitations
 
-- `cache_control` blocks are silently dropped because OpenAI has no equivalent
-- `count_tokens` is an estimate (`len(body)/4`); exact counting would require adding tiktoken or another tokenizer
-- In streaming mode, `input_tokens` is `0` in the initial `message_start`; when usage arrives later from upstream, internal state is updated but `message_start` has already been sent. The final `message_delta` still reports the correct `output_tokens`.
-- Prefill behavior, where the final input message is an assistant turn, may differ across OpenAI-compatible models
+- `count_tokens` is only a rough estimate
+- `cache_control` blocks are dropped because OpenAI-compatible APIs usually have no equivalent
+- `LISTEN_ADDR` changes require restart
+- Streaming support depends on how faithfully the upstream implements OpenAI-style SSE
 
 ## License
 

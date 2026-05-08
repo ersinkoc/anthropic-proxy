@@ -65,6 +65,19 @@ Or:
 make build
 ```
 
+## Usage
+
+```bash
+# Default .env
+./anthropic-proxy
+
+# Custom config path
+./anthropic-proxy /path/to/config.env
+
+# Help
+./anthropic-proxy --help
+```
+
 Cross-compile examples:
 
 ```bash
@@ -343,10 +356,13 @@ Hot-reloaded settings:
 - `PROXY_CLIENT_KEY`
 - `REQUEST_TIMEOUT_SEC`
 - `DEBUG`
+- `RATE_LIMIT`
+- `RATE_LIMIT_WINDOW_SEC`
 
 Not hot-reloaded:
 
 - `LISTEN_ADDR`
+- Config file path argument (CLI)
 
 Changing `LISTEN_ADDR` still requires restarting the process because the server socket is already bound.
 
@@ -363,6 +379,8 @@ Changing `LISTEN_ADDR` still requires restarting the process because the server 
 | `REQUEST_TIMEOUT_SEC` | no | `600` | yes | Per-request upstream timeout |
 | `DEBUG` | no | `0` | yes | Enable request logging |
 | `LISTEN_ADDR` | no | `:8787` | no | HTTP bind address |
+| `RATE_LIMIT` | no | `0` (disabled) | yes | Max requests per window |
+| `RATE_LIMIT_WINDOW_SEC` | no | `60` | yes | Rate limit window in seconds |
 
 ## Example `.env` Files
 

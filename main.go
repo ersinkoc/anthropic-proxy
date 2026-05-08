@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -23,6 +24,49 @@ import (
 // CONFIG
 // =============================================================================
 
+// Config whitelist for upstream hosts
+var allowedUpstreamHosts = map[string]bool{
+	"api.openai.com":                         true,
+	"integrate.api.nvidia.com":               true,
+	"api.anthropic.com":                       true,
+	"api.deepseek.com":                        true,
+	"openrouter.ai":                           true,
+	"api.groq.com":                            true,
+}
+
+func isUpstreamAllowed(urlStr string) bool {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "127.0.0.1" {
+		return true // Local dev allowed
+	}
+	if strings.HasPrefix(host, "10.") ||
+		strings.HasPrefix(host, "192.168.") ||
+		strings.HasPrefix(host, "172.16.") ||
+		strings.HasPrefix(host, "172.31.") ||
+		strings.HasPrefix(host, "172.17.") ||
+		strings.HasPrefix(host, "172.18.") ||
+		strings.HasPrefix(host, "172.19.") ||
+		strings.HasPrefix(host, "172.20.") ||
+		strings.HasPrefix(host, "172.21.") ||
+		strings.HasPrefix(host, "172.22.") ||
+		strings.HasPrefix(host, "172.23.") ||
+		strings.HasPrefix(host, "172.24.") ||
+		strings.HasPrefix(host, "172.25.") ||
+		strings.HasPrefix(host, "172.26.") ||
+		strings.HasPrefix(host, "172.27.") ||
+		strings.HasPrefix(host, "172.28.") ||
+		strings.HasPrefix(host, "172.29.") ||
+		strings.HasPrefix(host, "172.30.") ||
+		strings.HasPrefix(host, "172.31.") {
+		return true // Private network allowed
+	}
+	return allowedUpstreamHosts[host]
+}
+
 type Config struct {
 	ListenAddr        string
 	UpstreamURL       string
@@ -33,6 +77,8 @@ type Config struct {
 	Debug             bool
 	ExpectedClientKey string
 	RequestTimeout    time.Duration
+	RateLimit         int
+	RateLimitWindow   time.Duration
 }
 
 type ConfigManager struct {
@@ -148,6 +194,8 @@ func loadConfig(fileEnv map[string]string) (*Config, error) {
 		Debug:             envBool(fileEnv, "DEBUG", false),
 		ExpectedClientKey: envOr(fileEnv, "PROXY_CLIENT_KEY", ""),
 		RequestTimeout:    time.Duration(envInt(fileEnv, "REQUEST_TIMEOUT_SEC", 600)) * time.Second,
+		RateLimit:         envInt(fileEnv, "RATE_LIMIT", 100),
+		RateLimitWindow:   time.Duration(envInt(fileEnv, "RATE_LIMIT_WINDOW_SEC", 60)) * time.Second,
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 10 * time.Minute
@@ -712,11 +760,51 @@ type Proxy struct {
 	cfgManager *ConfigManager
 	client     *http.Client
 	reqNum     atomic.Uint64
+	rateLimiter *RateLimiter
+}
+
+type RateLimiter struct {
+	mu       sync.Mutex
+	counts   map[string]int
+	lastReset time.Time
+	limit    int
+	window   time.Duration
+}
+
+func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
+	return &RateLimiter{
+		counts:    make(map[string]int),
+		lastReset: time.Now(),
+		limit:     limit,
+		window:    window,
+	}
+}
+
+func (rl *RateLimiter) Allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	if now.Sub(rl.lastReset) > rl.window {
+		rl.counts = make(map[string]int)
+		rl.lastReset = now
+	}
+	count := rl.counts[ip] + 1
+	if count > rl.limit {
+		return false
+	}
+	rl.counts[ip] = count
+	return true
 }
 
 func NewProxy(cfgManager *ConfigManager) *Proxy {
+	cfg := cfgManager.Current()
+	var rateLimiter *RateLimiter
+	if cfg.RateLimit > 0 && cfg.RateLimitWindow > 0 {
+		rateLimiter = NewRateLimiter(cfg.RateLimit, cfg.RateLimitWindow)
+	}
 	return &Proxy{
 		cfgManager: cfgManager,
+		rateLimiter: rateLimiter,
 		client: &http.Client{
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
@@ -749,6 +837,20 @@ func (p *Proxy) mapModel(cfg *Config, anthropicModel string) string {
 	return anthropicModel
 }
 
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header first (for proxies/load balancers)
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		parts := strings.Split(fwd, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	// Fall back to X-Real-IP
+	if real := r.Header.Get("X-Real-IP"); real != "" {
+		return real
+	}
+	// Direct connection
+	return r.RemoteAddr[:strings.LastIndex(r.RemoteAddr, ":")]
+}
+
 func (p *Proxy) checkAuth(r *http.Request, cfg *Config) bool {
 	if cfg.ExpectedClientKey == "" {
 		return true
@@ -767,13 +869,22 @@ func (p *Proxy) checkAuth(r *http.Request, cfg *Config) bool {
 func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 	cfg := p.currentConfig()
 	reqID := p.reqNum.Add(1)
+
+	// Rate limiting
+	clientIP := getClientIP(r)
+	if p.rateLimiter != nil && !p.rateLimiter.Allow(clientIP) {
+		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error", "rate limit exceeded")
+		return
+	}
+
 	if !p.checkAuth(r, cfg) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid x-api-key")
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	// Limit body to 1MB to prevent memory exhaustion
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "request body too large")
 		return
 	}
 	defer r.Body.Close()
@@ -805,6 +916,10 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) handleSync(w http.ResponseWriter, ctx context.Context, cfg *Config, areq *AnthropicRequest, oreq *OpenAIRequest, reqID uint64) {
+	if !isUpstreamAllowed(cfg.UpstreamURL) {
+		writeAnthropicError(w, http.StatusForbidden, "invalid_request_error", "upstream URL not allowed")
+		return
+	}
 	ctx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
 
@@ -1021,6 +1136,10 @@ func (s *streamState) finish() error {
 }
 
 func (p *Proxy) handleStream(w http.ResponseWriter, ctx context.Context, cfg *Config, areq *AnthropicRequest, oreq *OpenAIRequest, reqID uint64) {
+	if !isUpstreamAllowed(cfg.UpstreamURL) {
+		writeAnthropicError(w, http.StatusForbidden, "invalid_request_error", "upstream URL not allowed")
+		return
+	}
 	ctx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
 
@@ -1271,11 +1390,22 @@ func logStartupConfig(cfg *Config) {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	cfgManager, err := NewConfigManager(".env")
+	// Config file path from CLI or default
+	configPath := ".env"
+	if len(os.Args) > 1 {
+		configPath = os.Args[1]
+	}
+
+	cfgManager, err := NewConfigManager(configPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
 	cfg := cfgManager.Current()
+
+	if cfg.Debug {
+		log.Printf("WARNING: debug mode is enabled — sensitive data may appear in logs")
+	}
+
 	logStartupConfig(cfg)
 
 	p := NewProxy(cfgManager)
